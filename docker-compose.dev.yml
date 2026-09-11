@@ -1,0 +1,23 @@
+services:
+  caddy:
+    build: !reset null
+    image: caddy:alpine
+    ports: !override
+      - "8080:80"
+    volumes:
+      - ./Caddyfile.dev:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+      - frontend
+
+  frontend:
+    build:
+      context: ${FRONTEND_PATH}
+      dockerfile: ${PWD}/Dockerfile.dev
+    volumes:
+      - ${FRONTEND_PATH}:/app
+      - /app/node_modules
+    environment:
+      VITE_API_BASE: http://localhost:8080/api

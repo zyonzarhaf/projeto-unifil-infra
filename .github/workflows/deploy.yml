@@ -1,0 +1,217 @@
+# Faz deploy no servidor de produção via AWS SSM.
+# Gera .env e docker-compose.yml, puxa as imagens e sobe os containers.
+# Roda migrations da API Laravel.
+# Só executa após o workflow "Infra CI" terminar com sucesso.
+name: Deploy
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Infra CI"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Generate config files
+        run: |
+          # Generate .env
+          if [ "${{ secrets.SERVER_PROTOCOL }}" = "https" ]; then
+            CADDY_ADDR="${{ secrets.SERVER_HOST }}"
+          else
+            CADDY_ADDR=":80"
+          fi
+
+          cat > /tmp/.env << EOF
+          CADDY_ADDRESS=${CADDY_ADDR}
+          DB_DATABASE=${{ secrets.DB_DATABASE }}
+          DB_USERNAME=${{ secrets.DB_USERNAME }}
+          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+          APP_NAME=${{ secrets.APP_NAME }}
+          APP_ENV=${{ secrets.APP_ENV }}
+          APP_KEY=${{ secrets.APP_KEY }}
+          APP_DEBUG=${{ secrets.APP_DEBUG }}
+          APP_URL=${{ secrets.SERVER_PROTOCOL }}://${{ secrets.SERVER_HOST }}
+          SESSION_DRIVER=${{ secrets.SESSION_DRIVER }}
+          SESSION_LIFETIME=${{ secrets.SESSION_LIFETIME }}
+          SESSION_DOMAIN=${{ secrets.SERVER_HOST }}
+          SESSION_SECURE_COOKIE=${{ secrets.SESSION_SECURE_COOKIE }}
+          JWT_SECRET=${{ secrets.JWT_SECRET }}
+          JWT_ALGO=${{ secrets.JWT_ALGO }}
+          CORS_ALLOWED_ORIGINS=${{ secrets.SERVER_PROTOCOL }}://${{ secrets.SERVER_HOST }}
+          EOF
+
+          # Generate docker-compose.yml
+          cat > /tmp/docker-compose.yml << 'EOF'
+          name: projeto-unifil-infra
+
+          services:
+            caddy:
+              image: ghcr.io/zyonzarhaf/unifil-caddy:latest
+              ports:
+                - "80:80"
+                - "443:443"
+              environment:
+                CADDY_ADDRESS: ${CADDY_ADDRESS}
+              volumes:
+                - caddy_data:/data
+                - caddy_config:/config
+              depends_on:
+                api:
+                  condition: service_healthy
+
+            db:
+              image: postgres:16-alpine
+              ports:
+                - "127.0.0.1:5432:5432"
+              environment:
+                POSTGRES_DB: ${DB_DATABASE}
+                POSTGRES_USER: ${DB_USERNAME}
+                POSTGRES_PASSWORD: ${DB_PASSWORD}
+              volumes:
+                - db_data:/var/lib/postgresql/data
+              healthcheck:
+                test: ["CMD", "pg_isready", "-U", "laravel", "-d", "projeto_unifil"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            api:
+              image: ghcr.io/zyonzarhaf/unifil-api:latest
+              environment:
+                APP_NAME: ${APP_NAME}
+                APP_ENV: ${APP_ENV}
+                APP_KEY: ${APP_KEY}
+                APP_DEBUG: ${APP_DEBUG}
+                APP_URL: ${APP_URL}
+                DB_CONNECTION: pgsql
+                DB_HOST: db
+                DB_PORT: 5432
+                DB_DATABASE: ${DB_DATABASE}
+                DB_USERNAME: ${DB_USERNAME}
+                DB_PASSWORD: ${DB_PASSWORD}
+                SESSION_DRIVER: ${SESSION_DRIVER}
+                SESSION_LIFETIME: ${SESSION_LIFETIME}
+                SESSION_DOMAIN: ${SESSION_DOMAIN}
+                SESSION_SECURE_COOKIE: ${SESSION_SECURE_COOKIE}
+                JWT_SECRET: ${JWT_SECRET}
+                JWT_ALGO: ${JWT_ALGO}
+                CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS}
+              depends_on:
+                db:
+                  condition: service_healthy
+              expose:
+                - "8000"
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:8000/up"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+          volumes:
+            db_data:
+            caddy_data:
+            caddy_config:
+          EOF
+
+          # Encode files as base64
+          ENV_B64=$(base64 -w0 /tmp/.env)
+          COMPOSE_B64=$(base64 -w0 /tmp/docker-compose.yml)
+
+          # Create JSON parameters file
+          cat > /tmp/params.json << JSONEOF
+          {
+            "commands": [
+              "mkdir -p ~/projeto-unifil-infra",
+              "echo ${ENV_B64} | base64 -d > ~/projeto-unifil-infra/.env",
+              "echo ${COMPOSE_B64} | base64 -d > ~/projeto-unifil-infra/docker-compose.yml"
+            ]
+          }
+          JSONEOF
+
+          echo "ENV_B64=${ENV_B64}" >> $GITHUB_ENV
+          echo "COMPOSE_B64=${COMPOSE_B64}" >> $GITHUB_ENV
+
+      - name: Deploy config files to EC2
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "{\"commands\":[\"sudo -u ubuntu mkdir -p /home/ubuntu/projeto-unifil-infra\",\"echo ${{ env.ENV_B64 }} | base64 -d | sudo -u ubuntu tee /home/ubuntu/projeto-unifil-infra/.env > /dev/null\",\"echo ${{ env.COMPOSE_B64 }} | base64 -d | sudo -u ubuntu tee /home/ubuntu/projeto-unifil-infra/docker-compose.yml > /dev/null\"]}" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Waiting for config deploy..."
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" || true
+
+          RESULT=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --query "Status" --output text)
+          echo "Config deploy status: $RESULT"
+          if [ "$RESULT" != "Success" ]; then
+            aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --query "StandardErrorContent" --output text
+            exit 1
+          fi
+
+      - name: Pull images and deploy
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "{\"commands\":[\"sudo -u ubuntu bash -c 'cd /home/ubuntu/projeto-unifil-infra && echo ${{ secrets.GHCR_TOKEN }} | docker login ghcr.io -u ${{ secrets.GHCR_USER }} --password-stdin && docker compose pull && docker compose up -d --remove-orphans'\"]}" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Waiting for deployment (this may take a few minutes)..."
+          for i in {1..30}; do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "Status: $STATUS"
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --query "[Status, StandardOutputContent, StandardErrorContent]" --output text
+
+          if [ "$STATUS" = "Failed" ]; then
+            exit 1
+          fi
+
+      - name: Run migrations
+        run: |
+          echo "Waiting for containers to be healthy..."
+          sleep 15
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "{\"commands\":[\"sudo -u ubuntu bash -c 'cd /home/ubuntu/projeto-unifil-infra && docker compose exec -T api php artisan migrate --force'\"]}" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "Waiting for migrations..."
+          for i in {1..20}; do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "Status: $STATUS"
+            if [ "$STATUS" = "Success" ] || [ "$STATUS" = "Failed" ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "${{ secrets.EC2_INSTANCE_ID }}" --query "[Status, StandardOutputContent, StandardErrorContent]" --output text
